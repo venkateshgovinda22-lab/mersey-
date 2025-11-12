@@ -1,0 +1,396 @@
+// index.js - Production Job Scraper with CORRECTED Data Extraction & Firebase Persistence
+// CRITICAL FIXES: Date Header Extraction, Column Indexing, Firebase Persistence
+
+// --- 1. IMPORTS ---
+import { createHash } from 'crypto';
+import puppeteer from 'puppeteer';
+import { initializeApp, getApps } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously } from 'firebase/auth';
+import { getFirestore, doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
+import cron from 'node-cron';
+
+// --- 2. FIREBASE INITIALIZATION ---
+let db;
+let auth;
+let currentUserId;
+
+async function initializeFirebase() {
+        try {
+                const firebaseConfigStr = process.env.__firebase_config;
+                const appId = process.env.__app_id || 'job-scraper-app';
+                const initialAuthToken = process.env.__initial_auth_token;
+
+                if (!firebaseConfigStr) {
+                        console.error('[FIREBASE] __firebase_config not set. Persistence is MANDATORY.');
+                        return false;
+                }
+
+                const firebaseConfig = JSON.parse(firebaseConfigStr);
+
+                let app;
+                if (getApps().length === 0) {
+                        app = initializeApp(firebaseConfig);
+                        console.log('[FIREBASE] App initialized');
+                } else {
+                        app = getApps()[0];
+                        console.log('[FIREBASE] Using existing app');
+                }
+
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                try {
+                        if (initialAuthToken) {
+                                console.log('[FIREBASE] Signing in with custom token...');
+                                await signInWithCustomToken(auth, initialAuthToken);
+                                console.log('[FIREBASE] Signed in with custom token');
+                        } else {
+                                console.log('[FIREBASE] Signing in anonymously...');
+                                await signInAnonymously(auth);
+                                console.log('[FIREBASE] Signed in anonymously');
+                        }
+                } catch (authError) {
+                        console.warn('[FIREBASE] Auth failed, falling back to anonymous:', authError.message);
+                        await signInAnonymously(auth);
+                        console.log('[FIREBASE] Signed in anonymously (fallback)');
+                }
+
+                currentUserId = auth.currentUser.uid;
+                console.log(`[FIREBASE] ✓ Persistence ENABLED | User: ${currentUserId}`);
+
+                return true;
+        } catch (error) {
+                console.error('[FIREBASE] Initialization failed:', error.message);
+                return false;
+        }
+}
+
+// --- 3. CONFIGURATION & CONSTANTS ---
+const LOGIN_URL = 'https://signups.org.uk/auth/login.php?xsi=12';
+
+const USERNAME_SELECTOR = 'input[name="username"]';
+const PASSWORD_SELECTOR = 'input[name="password"]';
+const LOGIN_BUTTON_SELECTOR = 'input[value="Login"]';
+const JOB_TABLE_SELECTOR = 'table';
+
+// Load secrets from environment
+const WEBSITE_USERNAME = process.env.WEBSITE_USERNAME;
+const WEBSITE_PASS = process.env.WEBSITE_PASS;
+const JOBS_PAGE_URL = process.env.JOBS_PAGE_URL;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+// --- 4. UTILITY FUNCTIONS ---
+
+/**
+ * Creates a unique, stable job ID from date, event, and doctor name.
+ * CRITICAL: Uses the CORRECT data structure for stable IDs.
+ */
+function createJobId(date, eventName, doctorName) {
+        const combined = `${date}|${eventName}|${doctorName}`;
+        const sanitized = combined.toLowerCase().replace(/\s+/g, ' ').trim();
+        return createHash('md5').update(sanitized).digest('hex');
+}
+
+/**
+ * Checks if a job is new (not in Firestore history).
+ * Firebase persistence is MANDATORY - throws if not initialized.
+ */
+async function isJobNew(jobId) {
+        if (!db || !currentUserId) {
+                throw new Error('Firebase persistence not initialized. Cannot check job history.');
+        }
+
+        try {
+                const appId = process.env.__app_id || 'job-scraper-app';
+                const docRef = doc(db, 'artifacts', appId, 'users', currentUserId, 'job_history', jobId);
+                const docSnap = await getDoc(docRef);
+
+                const isNew = !docSnap.exists();
+                if (!isNew) {
+                        console.log(`[HISTORY] Job ${jobId.substring(0, 8)}... already seen. Skipping.`);
+                }
+
+                return isNew;
+        } catch (error) {
+                console.error('[FIRESTORE] Check failed:', error.message);
+                throw error; // Fail fast - cannot continue without persistence
+        }
+}
+
+/**
+ * Saves a new job to Firestore history.
+ * Firebase persistence is MANDATORY - throws if not initialized.
+ */
+async function saveJobToHistory(jobId, jobData) {
+        if (!db || !currentUserId) {
+                throw new Error('Firebase persistence not initialized. Cannot save job history.');
+        }
+
+        try {
+                const appId = process.env.__app_id || 'job-scraper-app';
+                const docRef = doc(db, 'artifacts', appId, 'users', currentUserId, 'job_history', jobId);
+
+                await setDoc(docRef, {
+                        ...jobData,
+                        jobId,
+                        savedAt: serverTimestamp(),
+                        firstSeen: new Date().toISOString()
+                });
+
+                console.log(`[FIRESTORE] ✓ Saved job ${jobId.substring(0, 8)}...`);
+        } catch (error) {
+                console.error('[FIRESTORE] Save failed:', error.message);
+                throw error; // Fail fast - cannot continue without persistence
+        }
+}
+
+// --- 5. TELEGRAM NOTIFICATION ---
+
+/**
+ * Sends Telegram notification with job details.
+ * UPDATED: Uses correct format: Date: [date] | Event: [eventName] | Doctor: [doctorName]
+ */
+async function sendTelegramNotification(newJobs) {
+        if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+                console.warn('[TELEGRAM] Credentials not set. Skipping notification.');
+                return;
+        }
+
+        console.log(`[TELEGRAM] Sending notification for ${newJobs.length} new jobs...`);
+
+        const jobListText = newJobs.map((job, index) => {
+                return `${index + 1}. Date: ${job.date} | Event: ${job.eventName} | Doctor: ${job.doctorName}`;
+        }).join('\n\n');
+
+        const message = `🚨 *NEW DOCTOR JOB ALERT!*\n\nFound ${newJobs.length} new Doctor job(s):\n\n${jobListText}\n\n🔗 [View Jobs Page](${JOBS_PAGE_URL})\n\n_Automated alert from your job scraper_`;
+
+        const telegramApiUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+        try {
+                const response = await fetch(telegramApiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                                chat_id: TELEGRAM_CHAT_ID,
+                                text: message,
+                                parse_mode: 'Markdown',
+                                disable_web_page_preview: false
+                        })
+                });
+
+                const data = await response.json();
+
+                if (data.ok) {
+                        console.log('[TELEGRAM] ✓ Notification sent successfully!');
+                } else {
+                        console.error('[TELEGRAM] API error:', data.description);
+                }
+        } catch (error) {
+                console.error('[TELEGRAM] Send failed:', error.message);
+        }
+}
+
+// --- 6. MAIN SCRAPER FUNCTION ---
+
+async function mainScraper() {
+        console.log('--- [START] Job Scraper Run ---');
+
+        // 1. Initialize Firebase (MANDATORY - persistence is required)
+        const firebaseReady = await initializeFirebase();
+        if (!firebaseReady) {
+                console.error('═══════════════════════════════════════════════════════════');
+                console.error('[FATAL ERROR] Firebase persistence is MANDATORY but not configured!');
+                console.error('[FATAL ERROR] The scraper cannot run without persistence.');
+                console.error('[FATAL ERROR] Without persistence, all jobs would be treated as new');
+                console.error('[FATAL ERROR] on every run, causing duplicate notifications.');
+                console.error('');
+                console.error('[SETUP REQUIRED] Please configure these environment variables:');
+                console.error('  1. __firebase_config (required): Firebase config JSON object');
+                console.error('  2. __app_id (optional): Defaults to "job-scraper-app"');
+                console.error('  3. __initial_auth_token (optional): Uses anonymous auth if not set');
+                console.error('═══════════════════════════════════════════════════════════');
+                throw new Error('Firebase persistence is mandatory. Cannot proceed without it.');
+        }
+        
+        // Log active Firebase configuration for verification
+        console.log(`[FIREBASE] ✓ Connected to project | User: ${currentUserId}`);
+
+        // 2. Validate credentials
+        if (!WEBSITE_USERNAME || !WEBSITE_PASS) {
+                throw new Error('[SECURITY ERROR] WEBSITE_USERNAME or WEBSITE_PASS not set in Secrets.');
+        }
+        if (!JOBS_PAGE_URL) {
+                console.error('[ERROR] JOBS_PAGE_URL not set.');
+                return;
+        }
+
+        let browser;
+        try {
+                // 3. Launch browser
+                console.log('[BROWSER] Launching Puppeteer...');
+                browser = await puppeteer.launch({
+                        headless: true,
+                        args: ['--no-sandbox', '--disable-setuid-sandbox']
+                });
+                const page = await browser.newPage();
+                await page.setViewport({ width: 1280, height: 800 });
+
+                // 4. Login
+                console.log(`[LOGIN] Navigating to: ${LOGIN_URL}`);
+                await page.goto(LOGIN_URL, { waitUntil: 'networkidle0' });
+
+                await page.waitForSelector(USERNAME_SELECTOR);
+                await page.type(USERNAME_SELECTOR, WEBSITE_USERNAME);
+                await page.type(PASSWORD_SELECTOR, WEBSITE_PASS);
+
+                console.log('[LOGIN] Submitting credentials...');
+                await page.evaluate((selector) => {
+                        document.querySelector(selector).closest('form').submit();
+                }, LOGIN_BUTTON_SELECTOR);
+
+                await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 });
+
+                if (page.url().includes('login.php')) {
+                        throw new Error('Login failed. Check WEBSITE_USERNAME and WEBSITE_PASS.');
+                }
+                console.log('[LOGIN] ✓ Success');
+
+                // 5. Scrape jobs page with CORRECTED column indexing
+                console.log(`[SCRAPE] Navigating to: ${JOBS_PAGE_URL}`);
+                await page.goto(JOBS_PAGE_URL, { waitUntil: 'networkidle0' });
+
+                await page.waitForSelector(JOB_TABLE_SELECTOR);
+                console.log('[SCRAPE] Extracting jobs with COMPLETE date header tracking...');
+
+                const doctorJobs = await page.evaluate(() => {
+                        const jobs = [];
+                        let currentDate = 'Unknown';
+
+                        // Get all table rows
+                        const rows = Array.from(document.querySelectorAll('table tr'));
+
+                        for (const row of rows) {
+                                const cells = row.querySelectorAll('td');
+
+                                // Skip empty rows
+                                if (cells.length === 0) continue;
+
+                                const firstCell = cells[0];
+                                const cellText = firstCell?.innerText.trim() || '';
+
+                                // CHECK 1: Is this a DATE HEADER row?
+                                // Look for colspan rows with green background
+                                const hasColspan = firstCell.hasAttribute('colspan') && parseInt(firstCell.getAttribute('colspan')) > 3;
+                                const style = window.getComputedStyle(firstCell);
+                                const bgColor = style.backgroundColor;
+                                const isGreenish = /rgb\(\s*\d+\s*,\s*2[0-5][0-9]\s*,/.test(bgColor);
+
+                                // Date patterns for header rows - MUST capture COMPLETE date text
+                                const dateHeaderPattern = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+\d{1,2}/i;
+
+                                if ((hasColspan && isGreenish) || (cells.length === 1 && dateHeaderPattern.test(cellText))) {
+                                        // CRITICAL FIX: Store the COMPLETE date text from the header
+                                        currentDate = cellText;
+                                        continue;
+                                }
+
+                                // CHECK 2: Is this a DOCTOR JOB row?
+                                // Need at least 3 columns to check for Doctor rows
+                                if (cells.length < 3) continue;
+
+                                const col0 = cellText;
+                                const col1 = cells[1]?.innerText.trim() || '';
+                                const col2 = cells[2]?.innerText.trim() || '';
+                                const col3 = cells[3]?.innerText.trim() || '';
+
+                                // Check if col0 contains a date range (indicates non-Doctor row)
+                                const hasDateRange = /\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d+\s+\d{2}:\d{2}\s*-\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d+\s+\d{2}:\d{2}\b/i.test(col0);
+
+                                if (hasDateRange) {
+                                        // This is a regular event row, extract date from col0 if present
+                                        const dateMatch = col0.match(/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d+/i);
+                                        if (dateMatch) {
+                                                currentDate = dateMatch[0];
+                                        }
+                                        continue; // Skip this row, not a Doctor job
+                                }
+
+                                // Only extract Doctor jobs (col0 = 'Doctor')
+                                if (col0 === 'Doctor') {
+                                        // CORRECTED column mapping per user instructions:
+                                        // col[0] = Job Role ("Doctor")
+                                        // col[1] = Event Name / Timings (e.g., "17:45 - 00:00", "Andy Breakell")
+                                        // col[2] = (Not used based on instructions)
+                                        // col[3] = Doctor Name (e.g., "Jack Lyon", "Unassigned")
+                                        jobs.push({
+                                                date: currentDate,
+                                                jobName: 'Doctor',
+                                                eventName: col1 || 'Unknown Event',  // cells[1] = eventName
+                                                doctorName: col3 || 'Unassigned'     // cells[3] = doctorName
+                                        });
+                                }
+                        }
+
+                        return jobs;
+                });
+
+                console.log(`[SCRAPE] ✓ Extracted ${doctorJobs.length} Doctor jobs`);
+
+                // 6. Filter new jobs using Firebase (MANDATORY persistence)
+                const newJobs = [];
+
+                for (const job of doctorJobs) {
+                        // CRITICAL FIX: Use correct, stable data for Job ID
+                        const jobId = createJobId(job.date, job.eventName, job.doctorName);
+                        const isNew = await isJobNew(jobId);
+
+                        if (isNew) {
+                                console.log(`[NEW JOB] Date: ${job.date} | Event: ${job.eventName} | Doctor: ${job.doctorName}`);
+                                newJobs.push(job);
+                                await saveJobToHistory(jobId, job);
+                        }
+                }
+
+                // 7. Send Telegram notification ONLY if there are new jobs
+                if (newJobs.length > 0) {
+                        console.log(`[ALERT] ${newJobs.length} new jobs detected!`);
+                        await sendTelegramNotification(newJobs);
+                } else {
+                        console.log('[STATE] No new Doctor jobs found.');
+                }
+
+                console.log(`[SUMMARY] Checked ${doctorJobs.length} jobs, found ${newJobs.length} new.`);
+
+        } catch (error) {
+                console.error('--- [CRITICAL ERROR] ---');
+                console.error(error.message);
+                throw error;
+        } finally {
+                if (browser) {
+                        await browser.close();
+                        console.log('[BROWSER] Closed.');
+                }
+                console.log('--- [END] Scraper Complete ---');
+        }
+}
+
+// --- 7. EXECUTION ---
+
+async function startScheduledScraper() {
+        console.log('[SCHEDULER] Starting initialization...');
+
+        // 1. Run immediately on startup
+        await mainScraper();
+
+        // 2. Set up subsequent scheduled runs (Hourly, Mon-Fri, 8 AM - 6 PM)
+        // CRON: '0 8-18 * * 1-5' -> At 0 minutes past the hour, between 8 AM and 6 PM (inclusive), on Monday through Friday.
+        cron.schedule('0 8-18 * * 1-5', () => {
+                console.log('--- [SCHEDULER TRIGGERED] Starting scheduled run ---');
+                mainScraper();
+        });
+
+        console.log('[SCHEDULER] Job scraper is now running in the background hourly (Mon-Fri, 8 AM - 6 PM). Keep this process active!');
+}
+
+startScheduledScraper();
